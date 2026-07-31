@@ -1,88 +1,68 @@
-version: "3.8"
-
 services:
-  # --- Local Postgres DB ---
   postgres:
     image: postgres:16-alpine
-    container_name: webhook_postgres
-    restart: always
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: secretpassword
+      POSTGRES_USER: webhook_relay
+      POSTGRES_PASSWORD: webhook_relay
       POSTGRES_DB: webhook_relay
     ports:
       - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d webhook_relay"]
+      test: ["CMD-SHELL", "pg_isready -U webhook_relay"]
       interval: 5s
-      timeout: 5s
+      timeout: 3s
       retries: 5
 
-  # --- Redis (Asynq Queue Backend) ---
   redis:
     image: redis:7-alpine
-    container_name: webhook_redis
-    restart: always
     ports:
       - "6379:6379"
-    volumes:
-      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
-      timeout: 5s
+      timeout: 3s
       retries: 5
 
-  # --- Fiber Ingestion API ---
   api:
     build:
       context: .
-      dockerfile: Dockerfile
-    container_name: webhook_api
-    command: ./api
-    ports:
-      - "3000:3000"
+      target: api
     environment:
-      - PORT=3000
-      - DATABASE_URL=postgres://postgres:secretpassword@postgres:5432/webhook_relay?sslmode=disable
-      - REDIS_ADDR=redis:6379
+      DATABASE_URL: postgres://webhook_relay:webhook_relay@postgres:5432/webhook_relay?sslmode=disable
+      REDIS_ADDR: redis:6379
+      API_PORT: 8080
+    ports:
+      - "8080:8080"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-    restart: on-failure
 
-  # --- Asynq Worker Process ---
   worker:
     build:
       context: .
-      dockerfile: Dockerfile
-    container_name: webhook_worker
-    command: ./worker
+      target: worker
     environment:
-      - DATABASE_URL=postgres://postgres:secretpassword@postgres:5432/webhook_relay?sslmode=disable
-      - REDIS_ADDR=redis:6379
+      DATABASE_URL: postgres://webhook_relay:webhook_relay@postgres:5432/webhook_relay?sslmode=disable
+      REDIS_ADDR: redis:6379
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-    restart: on-failure
 
-  # --- Asynq Queue UI Dashboard ---
   asynqmon:
     image: hibiken/asynqmon:latest
-    container_name: webhook_asynqmon
-    ports:
-      - "8080:8080"
+    platform: linux/amd64
     command: ["--redis-addr=redis:6379"]
+    ports:
+      - "8081:8080"
     depends_on:
       redis:
         condition: service_healthy
 
 volumes:
-  postgres_data:
-  redis_data:
+  pgdata:

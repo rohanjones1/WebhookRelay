@@ -1,0 +1,20 @@
+# Environment
+.env
+
+# Compiled binaries
+/bin/
+webhook-relay
+api
+worker
+
+# Go build artifacts
+*.exe
+*.test
+*.out
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store

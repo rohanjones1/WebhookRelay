@@ -1,29 +1,25 @@
-# --- Stage 1: Build Binaries ---
+# syntax=docker/dockerfile:1
+
 FROM golang:1.22-alpine AS builder
+WORKDIR /src
 
-WORKDIR /app
-
-# Install dependencies
-COPY go.mod go.sum ./
+COPY go.mod go.sum* ./
 RUN go mod download
 
-# Copy source code
 COPY . .
 
-# Build both API and Worker binaries
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /bin/api ./cmd/api
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /bin/worker ./cmd/worker
+RUN CGO_ENABLED=0 go build -o /out/api ./cmd/api
+RUN CGO_ENABLED=0 go build -o /out/worker ./cmd/worker
 
-# --- Stage 2: Minimal Runtime ---
-FROM alpine:latest
+# --- api image ---
+FROM alpine:3.19 AS api
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /out/api /usr/local/bin/api
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/api"]
 
-RUN apk --no-cache add ca-certificates tzdata
-
-WORKDIR /root/
-
-# Copy binaries from builder
-COPY --from=builder /bin/api ./api
-COPY --from=builder /bin/worker ./worker
-
-# Default command (overridden in docker-compose)
-CMD ["./api"]
+# --- worker image ---
+FROM alpine:3.19 AS worker
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /out/worker /usr/local/bin/worker
+ENTRYPOINT ["/usr/local/bin/worker"]

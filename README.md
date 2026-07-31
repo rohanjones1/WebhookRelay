@@ -1,47 +1,132 @@
-# Webhook Relay 🪝
+# 🪝 Webhook Relay
 
-A high-throughput, resilient webhook delivery microservice built in Go.
+A high-throughput, fault-tolerant webhook delivery microservice. It sits between an event publisher and third-party consumer endpoints to guarantee **at-least-once delivery** — decoupling HTTP ingestion from background delivery, with automatic retries, exponential backoff, and a dead-letter queue for events that ultimately fail.
 
-Webhook Relay guarantees **at-least-once delivery** of API payloads. It acts as an asynchronous middleware between systems, decoupling ingestion from execution to ensure 0% data loss during downstream outages, network failures, or traffic spikes.
+## Why this exists
 
-## ✨ Features
+Without a relay, if a customer's server is down or times out when you call their webhook endpoint, the request is just... gone — usually surfacing only as a line in a log, requiring manual intervention to notice and resend. Webhook Relay accepts the event immediately (sub-10ms), persists it, and takes responsibility for getting it delivered — retrying on failure and giving full visibility into what happened and why.
 
-- 🚀 **High Throughput:** Capable of ingesting 10,000+ events per second without blocking the sender.
-- ♻️ **Automated Retries:** Implements exponential backoff for failed deliveries, preventing thundering herd problems on downstream servers.
-- 🛡️ **Zero Data Loss:** Safely logs all incoming payloads to PostgreSQL before queuing, ensuring recoverability in the event of a worker crash.
-- 📬 **Dead Letter Queue (DLQ):** Automatically isolates payloads that fail after maximum retry attempts for manual inspection.
+## Architecture
 
-## 🛠️ Tech Stack
+```text
+[ Client / Publisher ]
+          │
+          │ 1. POST /api/v1/webhooks
+          ▼
+┌───────────────────┐
+│   Fiber (API)     │ ── 2. INSERT status='PENDING' ──► [ Postgres ]
+└─────────┬─────────┘
+          │ 3. Enqueue job ("webhook:deliver")
+          ▼
+┌───────────────────┐
+│   Asynq Client    │ ── 4. Push payload to memory ───► [    Redis    ]
+└─────────┬─────────┘
+          │
+          └─ 5. Return HTTP 202 Accepted (~5-10ms)
 
-- **Language:** Go (Golang)
-- **API Framework:** Fiber
-- **Task Queue:** Asynq
-- **In-Memory Store:** Redis
-- **Database:** PostgreSQL (Neon)
-- **Infrastructure:** Docker & Docker Compose
+┌───────────────────┐
+│   Asynq Worker    │ ── 6. HTTP POST ───────► [ Target Customer Server ]
+└─────────┬─────────┘
+          │
+   ┌──────┴──────────────────────────┐
+   │                                 │
+[ SUCCESS: 2xx ]            [ FAILURE: 4xx/5xx/timeout ]
+   │                                 │
+   ▼                                 ▼
+Postgres: status="DELIVERED"   Re-queue with exponential backoff
+                               (10s → 1m → 5m → 30m). After 5
+                               attempts ──► status="FAILED" (DLQ)
+```
 
-## 🏗️ System Architecture
+Every delivery attempt — success or failure — is also written to an append-only `delivery_attempts` audit table, independent of the webhook's current state, so full history is queryable even after the event reaches a terminal status.
 
-1. **Ingestion:** API receives a webhook payload via POST request.
-2. **Persistence:** State is immediately saved to Postgres (`PENDING`), and the payload is pushed to Redis.
-3. **Acknowledgment:** API instantly returns `202 Accepted` to the sender.
-4. **Execution:** Background Go workers pull the job from Redis and attempt delivery to the target URL.
-5. **Resolution:**
-   - _Success (2xx):_ Marks Postgres status as `DELIVERED`.
-   - _Failure (4xx/5xx):_ Increments retry count and re-queues with exponential backoff.
-   - _Exhausted:_ Moves to Dead Letter Queue (DLQ) and marks as `FAILED`.
+## Tech stack
 
-## 🚀 Quick Start
+| Layer              | Technology                                | Why                                                                          |
+| :----------------- | :---------------------------------------- | :--------------------------------------------------------------------------- |
+| Language           | Go 1.22+                                  | Native concurrency, low memory footprint, built for high-throughput I/O      |
+| HTTP framework     | [Fiber v2](https://gofiber.io/)           | `fasthttp`-based, sub-10ms routing                                           |
+| Queue / dispatcher | [Asynq](https://github.com/hibiken/asynq) | Background task queue with retry/backoff/DLQ primitives                      |
+| Queue storage      | Redis 7                                   | Backing store for Asynq                                                      |
+| Database           | PostgreSQL                                | Durable state + audit log                                                    |
+| DB driver          | [pgx/v5](https://github.com/jackc/pgx)    | Direct SQL, no ORM                                                           |
+| Containerization   | Docker + Docker Compose                   | Local parity across API, worker, Redis, Postgres, and the Asynqmon dashboard |
+| Load testing       | k6                                        | Verifying throughput/latency claims                                          |
 
-### Prerequisites
+## Features
 
-- [Docker](https://docs.docker.com/get-docker/) & Docker Compose
-- Go 1.21+ (if running locally without Docker)
+- ✅ Sub-10ms ingestion, decoupled from delivery via a background queue
+- ✅ Idempotent ingestion — duplicate `idempotency_key` requests are safely deduplicated at the DB level
+- ✅ Exponential backoff retries (10s → 1m → 5m → 30m), configurable per-event `max_attempts`
+- ✅ Dead-letter handling — events that exhaust retries are marked `FAILED` rather than silently dropped
+- ✅ Full delivery audit trail — every attempt (status code, error, duration) is recorded
+- ✅ Status lookup API for tracking any event's delivery state
+- 🔲 HMAC request signing (inbound verification + outbound signatures) — in progress
+- 🔲 Manual DLQ replay endpoint — in progress
+- 🔲 Multi-tenant endpoint subscriptions — planned
 
-### Run with Docker
+## Quickstart
 
-1. Clone the repository:
-   ```bash
-   git clone [https://github.com/yourusername/webhook-relay.git](https://github.com/yourusername/webhook-relay.git)
-   cd webhook-relay
-   ```
+```bash
+git clone <this-repo>
+cd webhook-relay
+cp .env.example .env
+docker compose up --build
+```
+
+Apply database migrations (requires [golang-migrate](https://github.com/golang-migrate/migrate)):
+
+```bash
+export DATABASE_URL="postgres://webhook_relay:webhook_relay@localhost:5432/webhook_relay?sslmode=disable"
+migrate -database "$DATABASE_URL" -path migrations up
+```
+
+Send a test event:
+
+```bash
+curl -X POST localhost:8080/api/v1/webhooks \
+  -H 'Content-Type: application/json' \
+  -d '{"idempotency_key":"test-001","target_url":"https://httpbin.org/status/200","payload":{"hello":"world"}}'
+```
+
+Check its status:
+
+```bash
+curl localhost:8080/api/v1/webhooks/<id>
+```
+
+Watch queue activity in the Asynqmon dashboard at [localhost:8081](http://localhost:8081).
+
+## API
+
+| Method | Path                   | Description                            |
+| :----- | :--------------------- | :------------------------------------- |
+| `POST` | `/api/v1/webhooks`     | Submit a new event for delivery        |
+| `GET`  | `/api/v1/webhooks/:id` | Look up the current status of an event |
+| `GET`  | `/healthz`             | Liveness check                         |
+
+**`POST /api/v1/webhooks`** body:
+
+```json
+{
+  "idempotency_key": "unique-per-event-string",
+  "target_url": "https://customer-server.example.com/webhook",
+  "payload": { "any": "json" },
+  "event_type": "order.created"
+}
+```
+
+## Verified behavior
+
+The full lifecycle has been run end-to-end locally:
+
+- An event pointed at a `200`-returning endpoint reaches `DELIVERED` on the first attempt.
+- An event pointed at a `500`-returning endpoint retries at 10s, 1m, 5m, and 30m intervals, incrementing `attempts` and recording each failure in `delivery_attempts`, before being marked `FAILED` after exhausting `max_attempts`.
+
+## Roadmap
+
+See [`webhook-relay-context.md`](./webhook-relay-context.md) for the full phased build plan, known design gaps, and planned resume-impact additions (Prometheus metrics, k6 load test results, CI).
+
+## License
+
+MIT
