@@ -17,6 +17,7 @@ import (
 	"webhook-relay/internal/database"
 	"webhook-relay/internal/models"
 	"webhook-relay/internal/queue"
+	"webhook-relay/internal/signing"
 )
 
 const deliveryTimeout = 5 * time.Second
@@ -57,7 +58,7 @@ func main() {
 	)
 
 	mux := asynq.NewServeMux()
-	mux.HandleFunc(queue.TypeWebhookDeliver, handleDeliver(db, httpClient, asynqClient))
+	mux.HandleFunc(queue.TypeWebhookDeliver, handleDeliver(db, httpClient, asynqClient, cfg))
 
 	log.Println("worker started")
 	if err := srv.Run(mux); err != nil {
@@ -69,7 +70,7 @@ func main() {
 // row from Postgres, attempts HTTP delivery, records the attempt, and either
 // marks the webhook DELIVERED, re-enqueues it for retry after a backoff
 // delay, or marks it FAILED once retries are exhausted.
-func handleDeliver(db *pgxpool.Pool, httpClient *http.Client, asynqClient *asynq.Client) asynq.HandlerFunc {
+func handleDeliver(db *pgxpool.Pool, httpClient *http.Client, asynqClient *asynq.Client, cfg *config.Config) asynq.HandlerFunc {
 	return func(ctx context.Context, t *asynq.Task) error {
 		var p queue.DeliverPayload
 		if err := json.Unmarshal(t.Payload(), &p); err != nil {
@@ -93,7 +94,7 @@ func handleDeliver(db *pgxpool.Pool, httpClient *http.Client, asynqClient *asynq
 		attemptNumber := w.Attempts + 1
 		start := time.Now()
 
-		statusCode, respBody, deliverErr := attemptDelivery(ctx, httpClient, w.TargetURL, w.Payload)
+		statusCode, respBody, deliverErr := attemptDelivery(ctx, httpClient, w.TargetURL, w.Payload, cfg.OutboundSigningSecret)
 		duration := int(time.Since(start).Milliseconds())
 
 		// Always record the attempt in the audit log, success or failure.
@@ -173,14 +174,20 @@ func handleDeliver(db *pgxpool.Pool, httpClient *http.Client, asynqClient *asynq
 // attemptDelivery makes the single outbound HTTP POST to the target. Returns
 // the response status code (0 if the request never got a response), a
 // truncated response body snippet for the audit log, and any transport-level
-// error (timeout, connection refused, etc).
-func attemptDelivery(ctx context.Context, client *http.Client, targetURL string, payload []byte) (int, string, error) {
+// error (timeout, connection refused, etc). If signingSecret is non-empty,
+// the request is signed with an X-Webhook-Signature header so the receiver
+// can verify it really came from this relay.
+func attemptDelivery(ctx context.Context, client *http.Client, targetURL string, payload []byte, signingSecret string) (int, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(payload))
 	if err != nil {
 		return 0, "", fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "webhook-relay/1.0")
+
+	if signingSecret != "" {
+		req.Header.Set("X-Webhook-Signature", signing.Sign(signingSecret, payload))
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {

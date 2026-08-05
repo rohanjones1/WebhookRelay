@@ -12,6 +12,7 @@ import (
 	"webhook-relay/internal/database"
 	"webhook-relay/internal/models"
 	"webhook-relay/internal/queue"
+	"webhook-relay/internal/signing"
 )
 
 // createWebhookRequest is the JSON body a publisher sends to
@@ -49,6 +50,20 @@ func main() {
 	})
 
 	app.Post("/api/v1/webhooks", func(c *fiber.Ctx) error {
+		if cfg.InboundSigningSecret != "" {
+			header := c.Get("X-Webhook-Signature")
+			if header == "" {
+				return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+					"error": "missing X-Webhook-Signature header",
+				})
+			}
+			if err := signing.Verify(cfg.InboundSigningSecret, c.Body(), header); err != nil {
+				return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+					"error": "invalid signature",
+				})
+			}
+		}
+
 		var req createWebhookRequest
 		if err := c.BodyParser(&req); err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
