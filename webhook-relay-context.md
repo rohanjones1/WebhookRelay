@@ -164,6 +164,11 @@ webhook-relay/
 ├── README.md                 # recruiter-facing project overview
 ├── webhook-relay-context.md  # this file
 │
+├── load-test/
+│   ├── webhook-relay-load-test.js    # k6: ramping-VU realistic load scenario
+│   ├── webhook-relay-ceiling-test.js # k6: ramping-arrival-rate ceiling discovery
+│   └── sink-server.go                # local Go stand-in target for delivery during load tests
+│
 ├── cmd/
 │   ├── api/main.go           # Fiber HTTP server (ingestion, status lookup, replay)
 │   └── worker/main.go        # Asynq worker (delivery + retry + HMAC signing logic)
@@ -220,7 +225,31 @@ webhook-relay/
 - **Manual replay** — created a webhook with `max_attempts:2` pointed at a failing endpoint, confirmed it reached `FAILED`, called the replay endpoint, confirmed it reset to `PENDING` (attempts back to 0) and re-ran the full retry cycle (proven via `updated_at` timestamp changing and re-reaching `FAILED` again, since the target was still broken).
 - `go build ./...` and `go test ./...` both pass clean across the whole project.
 
-### 8.4 Known gaps still open (see Section 5 for full detail)
+### 8.4 Load testing (k6) — done
+
+Ran with `k6` against `POST /api/v1/webhooks` (ingestion path only — the API returns `202` after DB insert + enqueue, before delivery happens, so this measures ingestion throughput, not delivery throughput). Tested locally via Docker Compose on a single MacBook Pro, against a local Go sink server (`sink-server.go`) standing in for a customer endpoint, so delivery latency/public-service load wasn't a confound.
+
+Two scripts:
+- `webhook-relay-load-test.js` — `ramping-vus` executor, simulates realistic concurrent clients with think-time.
+- `webhook-relay-ceiling-test.js` — `ramping-arrival-rate` executor, directly controls target RPS (decoupled from VU count) to find the true throughput ceiling.
+
+**Results:**
+
+| Scenario | Rate | p90 | p95 | Errors | Notes |
+|---|---|---|---|---|---|
+| Realistic load (500 VUs) | 2,268 req/s | — | 22.15ms | 0% | VU/think-time-bound, not a ceiling measurement |
+| Sustained ceiling | 1,300 req/s | 3.07ms | 28.65ms | 0% | Stable — Postgres CPU flat ~130-180% over 3min hold |
+| Beyond ceiling | 2,000 req/s | 11.66ms | 101.83ms | 0% | Degrading — Postgres CPU climbed 180%→220% over 3min, latency tail growing |
+
+**Bottleneck identified:** sustained rates above ~1,300-1,500 req/s make the Postgres container CPU-bound (confirmed live via `docker stats`) before the Fiber/Go API layer shows strain. Median latency stays low even in the degrading scenario — degradation shows up first in the p95/p99 tail, consistent with connection-pool queuing or lock contention rather than raw request-handling capacity. Ceiling was found by bisection: ramped a wide range first (1,000→10,000 req/s, which VU-starved and undercounted the true ceiling), then re-ran flat-rate 3-minute holds at decreasing rates until CPU/latency stopped climbing and plateaued instead.
+
+**Caveat for write-ups:** Postgres and the worker share one Docker Desktop VM's CPU on a single host, so this ceiling reflects resource contention on one machine, not necessarily where a properly-provisioned production Postgres would cap out. Worth stating explicitly rather than omitting.
+
+**Not yet measured:** effect of tuning Postgres `MaxConns`/indexing on the ceiling; true delivery-path throughput (separately bounded by target endpoint latency + backoff schedule).
+
+Results written up in README under "Load Testing (k6)".
+
+### 8.5 Known gaps still open (see Section 5 for full detail)
 
 - No delivery timeout circuit breaker (timeout exists per-request via `http.Client{Timeout: 5s}`, but no circuit breaker across repeated failures to the same target).
 - No way to override `target_url` on replay (replay always retries against the original URL).
@@ -228,7 +257,7 @@ webhook-relay/
 - Multi-tenancy (`endpoints`/`subscriptions` table) not modeled — currently single `target_url` per event, no per-customer registration.
 - No Prometheus metrics, no k6 load test results yet, no CI.
 
-### 8.5 Local dev environment notes (useful context for a fresh AI session)
+### 8.6 Local dev environment notes (useful context for a fresh AI session)
 
 - Developer is on macOS, using `(base)` conda environment in zsh, Docker Desktop for containers.
 - `migrate` CLI (golang-migrate) is installed via `go install` and `$(go env GOPATH)/bin` has been added to `~/.zshrc` PATH.
@@ -238,13 +267,14 @@ webhook-relay/
 ## 9. Next Steps (in priority order)
 
 1. **~~HMAC signing~~ — done.** ~~Manual replay endpoint~~ — **done.**
-2. **k6 load test** *(current priority)* — script a realistic load test, capture real RPS/p95/p99 numbers, put them in the README. This is the most concrete, resume-verifiable claim available and hasn't been started yet.
-3. **Prometheus metrics** — expose `/metrics` (queue depth, delivery success rate, latency histogram).
+2. **~~k6 load test~~ — done.** Realistic load (2,268 req/s @ 500 VUs) and sustained ceiling (~1,300 req/s, Postgres CPU-bound) both measured and written up in README. See Section 8.4.
+3. **Prometheus metrics** *(current priority)* — expose `/metrics` (queue depth, delivery success rate, latency histogram).
 4. **GitHub Actions CI** — run `go test ./...` and a `docker compose up` smoke test on push.
-5. **(Optional polish) Replay with target_url override** — let `POST /api/v1/webhooks/:id/replay` accept an optional new `target_url` in the body, so a "broken endpoint → fixed → replayed successfully" demo is possible without manually editing the database.
-6. **(Optional/scope decision) Multi-tenancy** — only worth doing if the story is "a real product," not just "a personal pipeline."
-7. **(Optional/lower priority) Circuit breaker per target URL** — mentioned in known gaps; not urgent at current single-user testing scale.
+5. **(Optional polish) Postgres tuning re-test** — tune `pgxpool.Config.MaxConns` / check indexing on hot columns, re-run the k6 ceiling test at 2,000 req/s to see if the bottleneck moves. Would make a good before/after pair in the README.
+6. **(Optional polish) Replay with target_url override** — let `POST /api/v1/webhooks/:id/replay` accept an optional new `target_url` in the body, so a "broken endpoint → fixed → replayed successfully" demo is possible without manually editing the database.
+7. **(Optional/scope decision) Multi-tenancy** — only worth doing if the story is "a real product," not just "a personal pipeline."
+8. **(Optional/lower priority) Circuit breaker per target URL** — mentioned in known gaps; not urgent at current single-user testing scale.
 
 ## 10. Version Control
 
-Project is committed to git and pushed to GitHub (`main` branch), with commits so far covering (in order): initial Phase 1 core path, HMAC signing + unit tests, manual DLQ replay endpoint with `max_attempts` override. `README.md` and `.gitignore` are in place; `.env` (real secrets, including signing secrets) is gitignored — only `.env.example` is tracked.
+Project is committed to git and pushed to GitHub (`main` branch), with commits so far covering (in order): initial Phase 1 core path, HMAC signing + unit tests, manual DLQ replay endpoint with `max_attempts` override, k6 load test suite + sink server + bottleneck findings written up in README. `README.md` and `.gitignore` are in place; `.env` (real secrets, including signing secrets) is gitignored — only `.env.example` is tracked. Load test scripts live in `load-test/` and are committed to the repo (not gitignored).

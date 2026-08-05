@@ -124,6 +124,26 @@ The full lifecycle has been run end-to-end locally:
 - An event pointed at a `200`-returning endpoint reaches `DELIVERED` on the first attempt.
 - An event pointed at a `500`-returning endpoint retries at 10s, 1m, 5m, and 30m intervals, incrementing `attempts` and recording each failure in `delivery_attempts`, before being marked `FAILED` after exhausting `max_attempts`.
 
+## Load Testing (k6)
+
+Load tests target `POST /api/v1/webhooks` — the ingestion path only. Since Webhook Relay's core design decouples ingestion from delivery (the API returns `202 Accepted` after a DB insert + queue enqueue, before any delivery attempt happens), this measures how fast events can be durably accepted, not delivery throughput. Delivery is handled asynchronously by the worker pool and is bounded separately by the backoff schedule and target endpoint availability.
+
+All tests run locally via Docker Compose (Postgres, Redis, API, worker) on a single MacBook Pro, against a local Go sink server standing in for a real customer endpoint (instant `200 OK`, no real network latency). Test scripts: [`webhook-relay-load-test.js`](./load-test/webhook-relay-load-test.js) (realistic concurrent-client simulation) and [`webhook-relay-ceiling-test.js`](./load-test/webhook-relay-ceiling-test.js) (throughput ceiling discovery).
+
+### Results
+
+| Scenario                            | Rate        | p90 latency | p95 latency | Error rate | Notes                                                                       |
+| ----------------------------------- | ----------- | ----------- | ----------- | ---------- | --------------------------------------------------------------------------- |
+| Realistic load (500 concurrent VUs) | 2,268 req/s | —           | 22.15ms     | 0%         | VU-bound (think-time limited), not a throughput ceiling                     |
+| Sustained ceiling                   | 1,300 req/s | 3.07ms      | 28.65ms     | 0%         | Stable — Postgres CPU flat (~130–180%) over 3 min hold                      |
+| Beyond ceiling                      | 2,000 req/s | 11.66ms     | 101.83ms    | 0%         | Degrading — Postgres CPU climbed 180%→220% over 3 min, latency tail growing |
+
+**Bottleneck identified:** at sustained rates above ~1,300–1,500 req/s, the Postgres container becomes CPU-bound (confirmed via `docker stats` during the run) before the Go/Fiber API layer shows any strain. Median latency stays low even under the degrading scenario (req/s=2,000, med≈2ms) — the bottleneck shows up first in tail latency (p95/p99), consistent with connection-pool queuing or lock contention rather than raw request-handling capacity.
+
+**Methodology note:** ceiling was found via `k6`'s `ramping-arrival-rate` executor (directly controls request rate, independent of VU count/think-time), bisecting between a known-stable rate and a known-degrading rate until CPU and latency both plateaued rather than climbed over a 3-minute hold.
+
+**Not yet measured:** effect of tuning Postgres `MaxConns` / indexing on the ceiling; true delivery-path throughput (bounded separately by target endpoint latency and the retry/backoff schedule).
+
 ## Roadmap
 
 See [`webhook-relay-context.md`](./webhook-relay-context.md) for the full phased build plan, known design gaps, and planned resume-impact additions (Prometheus metrics, k6 load test results, CI).
