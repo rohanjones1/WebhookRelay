@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"webhook-relay/internal/config"
 	"webhook-relay/internal/database"
@@ -22,6 +24,11 @@ type createWebhookRequest struct {
 	TargetURL      string          `json:"target_url"`
 	Payload        json.RawMessage `json:"payload"`
 	EventType      *string         `json:"event_type,omitempty"`
+
+	// MaxAttempts optionally overrides the default retry count (5).
+	// Mainly useful for testing/demoing the DLQ path quickly instead of
+	// waiting through the full backoff schedule. Must be between 1 and 10.
+	MaxAttempts *int `json:"max_attempts,omitempty"`
 }
 
 func main() {
@@ -76,12 +83,22 @@ func main() {
 			})
 		}
 
+		maxAttempts := 5
+		if req.MaxAttempts != nil {
+			if *req.MaxAttempts < 1 || *req.MaxAttempts > 10 {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+					"error": "max_attempts must be between 1 and 10",
+				})
+			}
+			maxAttempts = *req.MaxAttempts
+		}
+
 		w := &models.Webhook{
 			IdempotencyKey: req.IdempotencyKey,
 			TargetURL:      req.TargetURL,
 			Payload:        req.Payload,
 			EventType:      req.EventType,
-			MaxAttempts:    5,
+			MaxAttempts:    maxAttempts,
 		}
 
 		if err := models.InsertWebhook(c.Context(), db, w); err != nil {
@@ -141,6 +158,55 @@ func main() {
 		}
 
 		return c.JSON(w)
+	})
+
+	app.Post("/api/v1/webhooks/:id/replay", func(c *fiber.Ctx) error {
+		id, err := uuid.Parse(c.Params("id"))
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "invalid id",
+			})
+		}
+
+		if err := models.ResetForReplay(c.Context(), db, id); err != nil {
+			if err == pgx.ErrNoRows {
+				// Either the id doesn't exist, or it exists but isn't in
+				// FAILED status — either way, not eligible for replay.
+				existing, getErr := models.GetWebhook(c.Context(), db, id)
+				if getErr == nil && existing != nil {
+					return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+						"error": fmt.Sprintf("webhook is in %s status, only FAILED webhooks can be replayed", existing.Status),
+					})
+				}
+				return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+					"error": "not found",
+				})
+			}
+			log.Printf("replay reset failed: %v", err)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "failed to reset webhook for replay",
+			})
+		}
+
+		task, err := queue.NewDeliverTask(id)
+		if err != nil {
+			log.Printf("build replay task failed: %v", err)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "failed to enqueue replay",
+			})
+		}
+
+		if _, err := asynqClient.EnqueueContext(c.Context(), task); err != nil {
+			log.Printf("enqueue replay failed: %v", err)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "failed to enqueue replay",
+			})
+		}
+
+		return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
+			"id":     id,
+			"status": "PENDING",
+		})
 	})
 
 	log.Printf("api listening on :%s", cfg.APIPort)

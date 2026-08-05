@@ -97,7 +97,32 @@ func InsertDeliveryAttempt(ctx context.Context, db *pgxpool.Pool, a *DeliveryAtt
 	).Scan(&a.ID, &a.AttemptedAt)
 }
 
-// DueForRetry finds PENDING webhooks whose next_attempt_at has passed —
+// ResetForReplay moves a FAILED webhook back to PENDING with attempts reset
+// to 0, so it can be re-enqueued and retried from scratch. Only rows
+// currently in FAILED status are eligible — this returns pgx.ErrNoRows if
+// the id doesn't exist or the webhook isn't in a replayable state, so the
+// caller can distinguish "not found" from "not eligible" from the row it
+// re-reads afterward.
+func ResetForReplay(ctx context.Context, db *pgxpool.Pool, id uuid.UUID) error {
+	const q = `
+		UPDATE webhooks
+		SET status = 'PENDING',
+		    attempts = 0,
+		    last_status_code = NULL,
+		    last_error = NULL,
+		    next_attempt_at = NULL,
+		    delivered_at = NULL
+		WHERE id = $1 AND status = 'FAILED'
+	`
+	tag, err := db.Exec(ctx, q, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
+}
 // this is what the worker polls (or what backs an Asynq task's readiness).
 func DueForRetry(ctx context.Context, db *pgxpool.Pool, limit int) ([]Webhook, error) {
 	const q = `

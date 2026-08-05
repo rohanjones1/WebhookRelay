@@ -59,10 +59,10 @@ Every delivery attempt — success or failure — is also written to an append-o
 - ✅ Idempotent ingestion — duplicate `idempotency_key` requests are safely deduplicated at the DB level
 - ✅ Exponential backoff retries (10s → 1m → 5m → 30m), configurable per-event `max_attempts`
 - ✅ Dead-letter handling — events that exhaust retries are marked `FAILED` rather than silently dropped
+- ✅ Manual DLQ replay — `POST /api/v1/webhooks/:id/replay` resets a `FAILED` event and re-attempts delivery on demand
+- ✅ Outbound HMAC-SHA256 request signing (`X-Webhook-Signature`, Stripe-style, replay-protected) — optional inbound verification too
 - ✅ Full delivery audit trail — every attempt (status code, error, duration) is recorded
 - ✅ Status lookup API for tracking any event's delivery state
-- 🔲 HMAC request signing (inbound verification + outbound signatures) — in progress
-- 🔲 Manual DLQ replay endpoint — in progress
 - 🔲 Multi-tenant endpoint subscriptions — planned
 
 ## Quickstart
@@ -99,11 +99,12 @@ Watch queue activity in the Asynqmon dashboard at [localhost:8081](http://localh
 
 ## API
 
-| Method | Path                   | Description                            |
-| :----- | :--------------------- | :------------------------------------- |
-| `POST` | `/api/v1/webhooks`     | Submit a new event for delivery        |
-| `GET`  | `/api/v1/webhooks/:id` | Look up the current status of an event |
-| `GET`  | `/healthz`             | Liveness check                         |
+| Method | Path                          | Description                                                         |
+| :----- | :---------------------------- | :------------------------------------------------------------------ |
+| `POST` | `/api/v1/webhooks`            | Submit a new event for delivery                                     |
+| `GET`  | `/api/v1/webhooks/:id`        | Look up the current status of an event                              |
+| `POST` | `/api/v1/webhooks/:id/replay` | Manually re-attempt a `FAILED` event (resets attempts, re-enqueues) |
+| `GET`  | `/healthz`                    | Liveness check                                                      |
 
 **`POST /api/v1/webhooks`** body:
 
