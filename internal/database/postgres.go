@@ -22,8 +22,8 @@ func NewPostgresPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 		return nil, fmt.Errorf("parse postgres dsn: %w", err)
 	}
 
-	cfg.MaxConns = 10
-	cfg.MinConns = 1
+	cfg.MaxConns = 50
+	cfg.MinConns = 5
 	cfg.MaxConnLifetime = 30 * time.Minute
 	cfg.MaxConnIdleTime = 5 * time.Minute
 
